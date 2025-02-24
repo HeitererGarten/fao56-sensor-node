@@ -33,8 +33,8 @@ typedef struct structPairing {
     uint8_t channel;
 } structPairing;
 
-int anaValue = 0;
-int anaPercentage = 0;
+long anaValue = 0;
+long anaPercentage = 0;
 
 // Flag for sensor data sent
 bool isSensorDataSent = false;
@@ -149,9 +149,7 @@ void readSensorsData() {
 
     // Set values to send
     strcpy(myData.nodeID, NODE_ID);
-    Serial.println(myData.nodeID);
     myData.msgType = DATA;
-
     myData.temp = dht.readTemperature();
     myData.humidity = dht.readHumidity();
     readSoilMoisture();
@@ -177,17 +175,13 @@ void readSensorsData() {
         Serial.println(" %");
     }
 
-    if (isnan(myData.moisture)) {
-        myData.moisture = DEFAULT_MEASUREMENT;
-        Serial.println("Failed to read moisture data");
-    }
-    else {
-        Serial.print("\nSoil Moisture Value: ");
-	    Serial.println(anaValue);
-	    Serial.print("Soil Moisture Percentage: ");
-	    Serial.print(anaPercentage);
-        Serial.println(" %");
-    }
+    //TODO: Add some checks for Moisture 
+    Serial.print("Moisture value: ");
+    Serial.println(anaValue);
+    Serial.print("Moisture percentage: ");
+    Serial.print(anaPercentage);
+    Serial.println("%");
+    
 }
 
 PairingStatus autoPairing() {
