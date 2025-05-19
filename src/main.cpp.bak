@@ -2,15 +2,11 @@
 #include <WiFi.h>
 #include <DHT.h>
 #include <esp_wifi.h>
-#include <Preferences.h>
-#include "config.h"
 
 // Set to broadcast to all ESP-Now-capable chips
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint8_t clientMacAddress[6];
 
-// GPIO pin for forced pairing
-#define PAIRING_BUTTON_PIN 0 // GPIO0 for pairing button
 #define MAX_CHANNEL 13
 
 // Deep Sleep constants 
@@ -37,9 +33,6 @@ typedef struct structPairing {
     uint8_t channel;
 } structPairing;
 
-// Preferences for storing paired MAC and channel
-Preferences preferences;
-
 long anaValue = 0;
 long anaPercentage = 0;
 
@@ -59,7 +52,6 @@ DHT dht(DHT_PIN, DHT_TYPE);
 esp_now_peer_info_t peerInfo;
 
 int channel = 1;
-bool isPaired = false;
 
 unsigned long currentMillis = millis();
 // Stores last time temperature was published 
@@ -107,56 +99,6 @@ void addPeer(const uint8_t * mac_addr, uint8_t chan) {
     memcpy(broadcastAddress, mac_addr, sizeof(uint8_t[6]));
 }
 
-// Save paired MAC to flash
-void savePairedMACToFlash(const uint8_t * mac_addr, uint8_t chan) {
-    preferences.begin("espnow", false);
-    preferences.putBytes("hubMac", mac_addr, 6);
-    preferences.putUChar("channel", chan);
-    preferences.putBool("paired", true);
-    preferences.end();
-    Serial.println("Hub MAC and channel saved to flash");
-}
-
-// Load paired MAC from flash if available
-bool loadPairedMACFromFlash() {
-    preferences.begin("espnow", false);
-    bool paired = preferences.getBool("paired", false);
-    
-    if (paired) {
-        uint8_t savedMac[6];
-        uint8_t savedChannel;
-        
-        if (preferences.getBytes("hubMac", savedMac, 6) == 6) {
-            savedChannel = preferences.getUChar("channel", 1);
-            
-            Serial.print("Found saved hub MAC: ");
-            printMAC(savedMac);
-            Serial.print(" on channel: ");
-            Serial.println(savedChannel);
-            
-            // Use the stored MAC and channel
-            memcpy(broadcastAddress, savedMac, sizeof(uint8_t[6]));
-            channel = savedChannel;
-            
-            // Set up connection with saved peer
-            addPeer(broadcastAddress, channel);
-            
-            preferences.end();
-            return true;
-        }
-    }
-    
-    preferences.end();
-    return false;
-}
-// Clear paired MAC from flash
-void clearPairedMAC() {
-    preferences.begin("espnow", false);
-    preferences.clear();
-    preferences.end();
-    Serial.println("Cleared saved hub MAC");
-}
-
 // Handle incoming data
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) {
     uint8_t type = incomingData[0];
@@ -170,8 +112,6 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
             Serial.print(pairingData.channel);  
             addPeer(pairingData.macAddr, pairingData.channel);
             // TODO: If u want to save the channel, do it here
-            // Save MAC and channel to flash
-            savePairedMACToFlash(pairingData.macAddr, pairingData.channel);
             // Update status
             pairingStatus = PAIR_PAIRED;
         }
@@ -191,10 +131,10 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 void readSoilMoisture() {
 	anaValue = analogRead(MOISTURE_PIN);
 	if (anaValue > AIR_VALUE) {
-        anaPercentage = 0;
+        anaPercentage = 100;
     }
     else if (anaValue < WATER_VALUE) {
-        anaPercentage = 100;
+        anaPercentage = 0;
     }
     else {
         // Note: We swap AIR_VALUE and WATER_VALUE in map() because:
@@ -300,17 +240,18 @@ void setup() {
     // Init Serial Monitor
     Serial.begin(115200);
 
-    // Configure pairing button with internal pullup
-    pinMode(PAIRING_BUTTON_PIN, INPUT_PULLUP);
+    // Begin sending on channel 1
+    pairingStatus = PAIR_REQUEST;
 
     // Set device as a Wi-Fi Station
     WiFi.mode(WIFI_STA);
+    WiFi.begin();
     Serial.print("Sensor node MAC Address:  ");
     readGetMacAddress();
     // ESP_NOW does not need WiFi beyond initial calibration
     WiFi.disconnect();
 
-    // Init ESP-NOW
+      // Init ESP-NOW
     if (esp_now_init() != 0) {
         Serial.println("Error initializing ESP-NOW");
         return;
@@ -326,57 +267,25 @@ void setup() {
     esp_sleep_enable_timer_wakeup(SLEEP_TIMER * uS_TO_S_FACTOR);
     isSensorDataSent = false;
 
-    // Check if button is pressed for forced pairing
-    bool forceNewPairing = (digitalRead(PAIRING_BUTTON_PIN) == LOW);
-    
-    if (forceNewPairing) {
-        Serial.println("Pairing button pressed - forcing new pairing");
-        clearPairedMAC();
-        pairingStatus = PAIR_REQUEST;
-    } else {
-        // Try to load stored MAC
-        isPaired = loadPairedMACFromFlash();
-        
-        if (isPaired) {
-            pairingStatus = PAIR_PAIRED;
-            Serial.println("Using stored hub MAC address");
-        } else {
-            Serial.println("No stored hub MAC, starting auto pairing");
-            pairingStatus = PAIR_REQUEST;
+    while (true) {
+        if (autoPairing() == PAIR_PAIRED) {
+            // Fill in all the attributes of myData instance
+            readSensorsData();
+
+            // Send message via ESP-NOW
+            esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+            
+            if (result == ESP_OK) {
+                Serial.println("Sent with success");
+                isSensorDataSent = true;
+            }
+            else {
+                Serial.println("Error sending the data");
+            }
         }
     }
-
-    // Only do auto pairing if needed
-    if (pairingStatus != PAIR_PAIRED) {
-        Serial.println("Starting auto pairing process...");
-        while (autoPairing() != PAIR_PAIRED) {
-            delay(10); // Small delay to prevent watchdog trigger
-        }
-    }
-
-    // After pairing is complete, send the sensor data
-    readSensorsData();
-
-    // Send message via ESP-NOW using the paired address
-    Serial.println("Sending data to paired hub:");
-    Serial.print("MAC: ");
-    printMAC(broadcastAddress);
-    Serial.print(" on channel: ");
-    Serial.println(channel);
-    
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
-    
-    if (result == ESP_OK) {
-        Serial.println("Sent with success");
-        isSensorDataSent = true;
-    }
-    else {
-        Serial.println("Error sending the data");
-    }
-    
-    // Give some time for the callback to trigger and send us to sleep
-    delay(100);
 }
  
 void loop() {
 }
+
