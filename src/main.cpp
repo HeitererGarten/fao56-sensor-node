@@ -9,6 +9,9 @@
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint8_t clientMacAddress[6];
 
+// Add these variables at the top with your other globals
+unsigned long sendAttemptTime = 0;
+const int SEND_TIMEOUT_MS = 10000;
 // GPIO pin for forced pairing
 #define PAIRING_BUTTON_PIN 0 // GPIO0 for pairing button
 #define MAX_CHANNEL 13
@@ -46,6 +49,7 @@ long anaPercentage = 0;
 // Flag for sensor data sent
 bool isSensorDataSent = false;
 
+bool validValue = true;
 // Instance of sensor data
 sensorData myData;
 // Instance of data to pair with the Hub
@@ -181,9 +185,10 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
 // Callback when data is sent
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     Serial.print("\nLast Packet Send Status: ");
-    Serial.println( ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+    Serial.println( status == ESP_NOW_SEND_SUCCESS  ? "Delivery Success" : "Delivery Fail");
     // Sleep activation must be here, otherwise data would not be sent
     if (status == ESP_NOW_SEND_SUCCESS && isSensorDataSent) {
+        
         esp_deep_sleep_start();
     }
 }
@@ -205,6 +210,7 @@ void readSoilMoisture() {
 }
 
 void readSensorsData() {
+    validValue = true;
     dht.begin();
 
     // Set values to send
@@ -218,6 +224,7 @@ void readSensorsData() {
     if (isnan(myData.temp)) {
         myData.temp = DEFAULT_MEASUREMENT;
         Serial.println("Failed to read temp data");
+        validValue = false;
     }
     else {
         Serial.print("\nTemp Value: ");
@@ -228,6 +235,7 @@ void readSensorsData() {
     if (isnan(myData.humidity)) {
         myData.humidity = DEFAULT_MEASUREMENT;
         Serial.println("Failed to read humidity data");
+        validValue = false;
     }
     else {
         Serial.print("\nHumidity Value: ");
@@ -364,14 +372,19 @@ void setup() {
     Serial.print(" on channel: ");
     Serial.println(channel);
     
+    if (!validValue) {
+        Serial.println("Invalid sensor data, not sending");
+        esp_deep_sleep_start();
+    }
     esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
     
     if (result == ESP_OK) {
-        Serial.println("Sent with success");
+        Serial.println("Sent initial data successfully");
         isSensorDataSent = true;
     }
     else {
-        Serial.println("Error sending the data");
+        Serial.println("Error sending the data will sleep anyway after timeout" );
+        sendAttemptTime = millis();
     }
     
     // Give some time for the callback to trigger and send us to sleep
@@ -379,4 +392,50 @@ void setup() {
 }
  
 void loop() {
+    // Check if pairing button is pressed during wait
+    if (digitalRead(PAIRING_BUTTON_PIN) == LOW) {
+        Serial.println("Pairing button pressed during wait - forcing new pairing");
+        clearPairedMAC();
+        pairingStatus = PAIR_REQUEST;
+        
+        // Start the auto pairing process
+        while (autoPairing() != PAIR_PAIRED) {
+            delay(10); // Small delay to prevent watchdog trigger
+        }
+        
+        // After pairing is complete, send the sensor data again
+        readSensorsData();
+        
+        // Send message via ESP-NOW using the newly paired address
+        Serial.println("Sending data to new paired hub:");
+        Serial.print("MAC: ");
+        printMAC(broadcastAddress);
+        Serial.print(" on channel: ");
+        Serial.println(channel);
+        
+        if (!validValue) {
+        Serial.println("Invalid sensor data, not sending");
+        esp_deep_sleep_start();
+    }
+        esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+        
+        if (result == ESP_OK) {
+            Serial.println("Sent data successfully after re-pairing");
+            isSensorDataSent = true;
+        }
+        else {
+            Serial.println("Error sending the data after re-pairing");
+        }
+        
+        // Reset timeout counter
+        sendAttemptTime = millis();
+    }
+    
+    // If we've been awake too long and sending failed or timed out, go to sleep anyway
+    if (millis() - sendAttemptTime > SEND_TIMEOUT_MS) {
+        Serial.println("Send timeout reached, going to sleep anyway");
+        esp_deep_sleep_start();
+    }
+    
+    delay(100); // Small delay to prevent watchdog trigger and allow ESP-NOW callback to work
 }
